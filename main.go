@@ -1,6 +1,8 @@
 package main
 
 import (
+	"archive/zip"
+	"bytes"
 	"flag"
 	"fmt"
 	"image"
@@ -10,77 +12,103 @@ import (
 	_ "image/png"
 	"math/rand"
 	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
 	xdraw "golang.org/x/image/draw"
 )
 
-type Config struct {
-	InputPath   string
-	OutputPath  string
-	JPEGQuality int     // 1..100
-	Scale       float64 // 0.1..1.0 (уменьшение и обратно)
-	Noise       int     // 0..100 интенсивность шума
-	Blur        bool    // простой blur
+type Preset struct {
+	Name        string
+	JPEGQuality int
+	Scale       float64
+	Noise       int
+	Blur        bool
 }
 
 func main() {
-	cfg := parseFlags()
+	inputPath := parseFlags()
 
-	img, err := loadImage(cfg.InputPath)
+	src, err := loadImage(inputPath)
 	if err != nil {
 		exitErr("ошибка загрузки изображения: %v", err)
 	}
 
-	// 1) Пикселизация через downscale/upscale
-	if cfg.Scale < 1.0 {
-		img = pixelate(img, cfg.Scale)
+	baseName := baseFileName(inputPath) // без расширения
+	if err := os.MkdirAll("output", 0o755); err != nil {
+		exitErr("не удалось создать папку output: %v", err)
 	}
 
-	// 2) Добавление шума
-	if cfg.Noise > 0 {
-		img = addNoise(img, cfg.Noise)
+	zipPath := filepath.Join("output", baseName+".zip")
+	zf, err := os.Create(zipPath)
+	if err != nil {
+		exitErr("не удалось создать zip архив: %v", err)
+	}
+	defer zf.Close()
+
+	zw := zip.NewWriter(zf)
+	defer zw.Close()
+
+	presets := []Preset{
+		{
+			Name:        "easy",
+			JPEGQuality: 65,
+			Scale:       0.85,
+			Noise:       5,
+			Blur:        false,
+		},
+		{
+			Name:        "normal",
+			JPEGQuality: 40,
+			Scale:       0.60,
+			Noise:       18,
+			Blur:        true,
+		},
+		{
+			Name:        "hard",
+			JPEGQuality: 18,
+			Scale:       0.35,
+			Noise:       35,
+			Blur:        true,
+		},
 	}
 
-	// 3) Простейший box blur
-	if cfg.Blur {
-		img = boxBlur(img)
+	for _, p := range presets {
+		out := applyPreset(src, p)
+
+		jpgBytes, err := encodeJPEGToBytes(out, p.JPEGQuality)
+		if err != nil {
+			exitErr("ошибка кодирования пресета %s: %v", p.Name, err)
+		}
+
+		fileNameInZip := fmt.Sprintf("%s_%s.jpg", baseName, p.Name)
+		w, err := zw.Create(fileNameInZip)
+		if err != nil {
+			exitErr("ошибка добавления файла %s в zip: %v", fileNameInZip, err)
+		}
+
+		if _, err := w.Write(jpgBytes); err != nil {
+			exitErr("ошибка записи файла %s в zip: %v", fileNameInZip, err)
+		}
 	}
 
-	// 4) Сжатие JPEG с quality
-	if err := saveJPEG(cfg.OutputPath, img, cfg.JPEGQuality); err != nil {
-		exitErr("ошибка сохранения изображения: %v", err)
+	if err := zw.Close(); err != nil {
+		exitErr("ошибка закрытия zip: %v", err)
 	}
 
-	fmt.Printf("Готово: %s\n", cfg.OutputPath)
+	fmt.Printf("Готово! Архив создан: %s\n", zipPath)
 }
 
-func parseFlags() Config {
-	var cfg Config
-
-	flag.StringVar(&cfg.InputPath, "in", "", "путь к входному изображению (jpg/png)")
-	flag.StringVar(&cfg.OutputPath, "out", "out.jpg", "путь к выходному jpeg")
-	flag.IntVar(&cfg.JPEGQuality, "quality", 40, "качество JPEG (1..100, меньше = хуже)")
-	flag.Float64Var(&cfg.Scale, "scale", 0.5, "коэффициент пикселизации (0.1..1.0)")
-	flag.IntVar(&cfg.Noise, "noise", 0, "интенсивность шума (0..100)")
-	flag.BoolVar(&cfg.Blur, "blur", false, "включить простой blur")
-
+func parseFlags() string {
+	var inputPath string
+	flag.StringVar(&inputPath, "in", "", "путь к входному изображению (jpg/png)")
 	flag.Parse()
 
-	if cfg.InputPath == "" {
+	if strings.TrimSpace(inputPath) == "" {
 		exitErr("обязательный параметр -in")
 	}
-	if cfg.JPEGQuality < 1 || cfg.JPEGQuality > 100 {
-		exitErr("-quality должен быть в диапазоне 1..100")
-	}
-	if cfg.Scale < 0.1 || cfg.Scale > 1.0 {
-		exitErr("-scale должен быть в диапазоне 0.1..1.0")
-	}
-	if cfg.Noise < 0 || cfg.Noise > 100 {
-		exitErr("-noise должен быть в диапазон�� 0..100")
-	}
-
-	return cfg
+	return inputPath
 }
 
 func loadImage(path string) (image.Image, error) {
@@ -94,14 +122,33 @@ func loadImage(path string) (image.Image, error) {
 	return img, err
 }
 
-func saveJPEG(path string, img image.Image, quality int) error {
-	f, err := os.Create(path)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
+func baseFileName(path string) string {
+	name := filepath.Base(path)
+	ext := filepath.Ext(name)
+	return strings.TrimSuffix(name, ext)
+}
 
-	return jpeg.Encode(f, img, &jpeg.Options{Quality: quality})
+func applyPreset(src image.Image, p Preset) image.Image {
+	img := src
+	if p.Scale < 1.0 {
+		img = pixelate(img, p.Scale)
+	}
+	if p.Noise > 0 {
+		img = addNoise(img, p.Noise)
+	}
+	if p.Blur {
+		img = boxBlur(img)
+	}
+	return img
+}
+
+func encodeJPEGToBytes(img image.Image, quality int) ([]byte, error) {
+	var buf bytes.Buffer
+	err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: quality})
+	if err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
 }
 
 func pixelate(src image.Image, scale float64) image.Image {
@@ -133,8 +180,7 @@ func addNoise(src image.Image, intensity int) image.Image {
 	dst := image.NewRGBA(b)
 	stddraw.Draw(dst, b, src, b.Min, stddraw.Src)
 
-	amp := intensity * 2 // амплитуда шума
-
+	amp := intensity * 2
 	for y := b.Min.Y; y < b.Max.Y; y++ {
 		for x := b.Min.X; x < b.Max.X; x++ {
 			r, g, bl, a := dst.At(x, y).RGBA()
@@ -144,7 +190,6 @@ func addNoise(src image.Image, intensity int) image.Image {
 			dst.Set(x, y, color.RGBA{uint8(rr), uint8(gg), uint8(bb), uint8(a >> 8)})
 		}
 	}
-
 	return dst
 }
 
@@ -155,7 +200,6 @@ func boxBlur(src image.Image) image.Image {
 	for y := b.Min.Y; y < b.Max.Y; y++ {
 		for x := b.Min.X; x < b.Max.X; x++ {
 			var rSum, gSum, bSum, aSum, count int
-
 			for ky := -1; ky <= 1; ky++ {
 				for kx := -1; kx <= 1; kx++ {
 					nx, ny := x+kx, y+ky
@@ -170,7 +214,6 @@ func boxBlur(src image.Image) image.Image {
 					count++
 				}
 			}
-
 			dst.Set(x, y, color.RGBA{
 				uint8(rSum / count),
 				uint8(gSum / count),
@@ -179,7 +222,6 @@ func boxBlur(src image.Image) image.Image {
 			})
 		}
 	}
-
 	return dst
 }
 
