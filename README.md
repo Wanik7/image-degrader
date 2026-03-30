@@ -55,6 +55,7 @@ Result:
 ├── main.go
 ├── go.mod
 ├── go.sum
+├── README.md
 └── output/
 ```
 
